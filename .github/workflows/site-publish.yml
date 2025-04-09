@@ -1,0 +1,118 @@
+# This workflow builds an MkDocs site and publishes it to an Azure file share.
+# The following variables and secrets must be configured in the repository:
+#
+# Required Variables/Secrets (Note: Either NGINX_SHARE_URL or NGINX_SHARE_SAS_URL is required, not both):
+# - vars.NGINX_SHARE_URL: The Azure file share URL using OIDC authentication
+#   - vars.AZURE_TENANT_ID: The Azure Tenant ID (required only when using NGINX_SHARE_URL)
+#   - vars.AZURE_CLIENT_ID: The Azure Client ID (required only when using NGINX_SHARE_URL)
+# OR
+# - secrets.NGINX_SHARE_SAS_URL: The Azure file share URL with SAS token for authentication
+#
+# Optional Variables:
+# - vars.PREVIEW_URL: The base URL for generating preview links for pull requests
+# - inputs.SITE_NAME: Override the site name for manual triggers.
+
+name: Site Publish
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      SITE_NAME:
+        type: string
+        required: false
+        description: Site name override
+
+permissions:
+  contents: read
+  id-token: write
+  pull-requests: write
+
+jobs:
+  site-publish:
+    runs-on: ubuntu-latest
+    env:
+      SITE_NAME: ${{ inputs.SITE_NAME }}
+      PREVIEW_URL: ''
+      NGINX_SHARE_URL: ${{ vars.NGINX_SHARE_URL }}
+      NGINX_SHARE_SAS_URL: ${{ secrets.NGINX_SHARE_SAS_URL }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Rclone setup
+        run: |
+          curl https://rclone.org/install.sh | sudo bash
+
+      - name: MkDocs setup
+        run: |
+          set -x
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -r requirements.txt
+
+      - name: MkDocs build
+        run: |
+          set -x
+          ./nginxsiteops.sh site-build
+
+      - name: Set env variables for pushs and manual triggers
+        if: env.SITE_NAME == '' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+        run: |
+          set -x
+          case "$GITHUB_REF" in
+            refs/heads/${{github.event.repository.default_branch}})
+              SITE_NAME=default ;;
+            refs/heads/*)
+              SITE_NAME=$(echo ${GITHUB_REF#refs/heads/} | tr /. -) ;;
+            *)
+              SITE_NAME="" ;;
+          esac
+          echo "SITE_NAME=${SITE_NAME}" >> $GITHUB_ENV
+
+      - name: Set env variables for PRs
+        if: github.event_name == 'pull_request' && vars.PREVIEW_URL != ''
+        run: |
+          set -x
+          SITE_NAME="pr-${{ github.event.number }}-${{ github.sha }}"
+          PREVIEW_URL=${PREVIEW_URL#*//}
+          PREVIEW_URL="https://${SITE_NAME}.${PREVIEW_URL}"
+          echo "SITE_NAME=${SITE_NAME}" >> $GITHUB_ENV
+          echo "PREVIEW_URL=${PREVIEW_URL}" >> $GITHUB_ENV
+        env:
+          PREVIEW_URL: ${{ vars.PREVIEW_URL }}
+
+      - name: Azure CLI with OIDC
+        if: env.SITE_NAME && vars.NGINX_SHARE_URL
+        uses: azure/login@v2
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          allow-no-subscriptions: true
+
+      - name: Rclone config & sync
+        id: rclone_sync
+        if: env.SITE_NAME && (env.NGINX_SHARE_URL || env.NGINX_SHARE_SAS_URL)
+        run: |
+          set -x
+          ./nginxsiteops.sh rclone-config
+          ./nginxsiteops.sh rclone-sync $SITE_NAME
+          echo 'done=true' >> $GITHUB_OUTPUT
+
+      - name: Post preview URL to PR
+        if: github.event_name == 'pull_request' && vars.PREVIEW_URL && steps.rclone_sync.outputs.done == 'true'
+        uses: actions/github-script@v6
+        with:
+          script: |
+            github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.payload.pull_request.number,
+              body: `Preview URL: ${process.env.PREVIEW_URL}`
+            });
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
